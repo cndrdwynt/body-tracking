@@ -81,19 +81,14 @@ except FileNotFoundError as e:
     exit()
 
 ### BARU: PENGATURAN POSISI GLOBAL ###
-# Atur jarak kepala dan badan di sini. Ini akan berlaku untuk SEMUA gestur.
-# Format: (penyesuaian_x, penyesuaian_y)
-GLOBAL_OFFSET_HEAD = (0, 140)  # Geser kepala ke atas 20 piksel
-GLOBAL_OFFSET_BODY = (0, -20)  # Geser badan ke bawah 190 piksel
-
+GLOBAL_OFFSET_HEAD = (0, 140)  #makin besar nilainya makin ke bawah
+GLOBAL_OFFSET_BODY = (0, -20)  #makin kecil nilainya makin ke atas
 
 # --- KONFIGURASI UNTUK SETIAP GESTUR ---
-# Sekarang hanya berisi aset gambar untuk setiap gestur.
 GESTURE_CONFIG = {
     "NORMAL": {
         "head": img_head_normal,
         "body": img_body_normal
-        ### DIHAPUS: "offset_head" dan "offset_body"
     },
     "BLUSHING": {
         "head": img_head_blush,
@@ -128,7 +123,10 @@ def get_finger_status(hand_landmarks):
         return status
         
     thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
-    thumb_ip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_IP]
+    
+    ### --- PERBAIKAN TYPO DI SINI --- ###
+    thumb_ip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_IP] 
+    
     if thumb_tip.y < thumb_ip.y:
         status['THUMB'] = True
 
@@ -143,17 +141,15 @@ def get_finger_status(hand_landmarks):
             status[finger_name] = True
     return status
 
-def is_fist(hand_landmarks):
-    if not hand_landmarks:
-        return False
-    finger_status = get_finger_status(hand_landmarks)
-    is_clenched = not any(finger_status.values())
-    return is_clenched
-
 # --- BUKA KAMERA & INISIALISASI ---
 cap = cv2.VideoCapture(0)
 history_head = deque(maxlen=5)
 history_body = deque(maxlen=5)
+
+# --- BARU: UNTUK GESTURE STABIL (DEBOUNCE) ---
+gesture_buffer = deque(maxlen=10) # Buffer untuk 10 frame terakhir
+stable_gesture = "NORMAL"         # Gestur yang akan ditampilkan
+# --------------------------------------------
 
 with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
     while cap.isOpened():
@@ -170,6 +166,7 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
         if results.pose_landmarks:
             pose = results.pose_landmarks.landmark
             
+            # --- LOGIKA GESTURE PRIORITAS 1: BLUSHING ---
             if results.left_hand_landmarks and results.right_hand_landmarks:
                 left_wrist = pose[mp_holistic.PoseLandmark.LEFT_WRIST]
                 right_wrist = pose[mp_holistic.PoseLandmark.RIGHT_WRIST]
@@ -179,17 +176,21 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
                     if abs(left_wrist.x - right_wrist.x) < 0.3:
                         current_gesture = "BLUSHING"
 
+            # --- LOGIKA GESTURE PRIORITAS 2: EXCITED, WAVE, DLL (JIKA TIDAK BLUSHING) ---
             if current_gesture == "NORMAL":
-                if is_fist(results.left_hand_landmarks) and is_fist(results.right_hand_landmarks):
-                    current_gesture = "EXCITED"
+                # Cek dulu kondisi tangan di atas bahu
+                is_right_wave = (results.right_hand_landmarks and pose[mp_holistic.PoseLandmark.RIGHT_WRIST].y < pose[mp_holistic.PoseLandmark.RIGHT_SHOULDER].y)
+                is_left_wave = (results.left_hand_landmarks and pose[mp_holistic.PoseLandmark.LEFT_WRIST].y < pose[mp_holistic.PoseLandmark.LEFT_SHOULDER].y)
 
-            if current_gesture == "NORMAL":
-                is_waving = (results.right_hand_landmarks and pose[mp_holistic.PoseLandmark.RIGHT_WRIST].y < pose[mp_holistic.PoseLandmark.RIGHT_SHOULDER].y) or \
-                            (results.left_hand_landmarks and pose[mp_holistic.PoseLandmark.LEFT_WRIST].y < pose[mp_holistic.PoseLandmark.LEFT_SHOULDER].y)
+                # 1. GESTUR EXCITED BARU: Kedua tangan di atas bahu
+                if is_right_wave and is_left_wave:
+                    current_gesture = "EXCITED"
                 
-                if is_waving:
+                # 2. GESTUR WAVE: Hanya salah satu tangan di atas bahu
+                elif is_right_wave or is_left_wave:
                     current_gesture = "WAVE"
                 
+                # 3. GESTUR TANGAN KANAN (jika tidak sedang melambai)
                 elif results.right_hand_landmarks:
                     hand_landmarks = results.right_hand_landmarks
                     finger_status = get_finger_status(hand_landmarks)
@@ -201,12 +202,20 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
                     elif math.hypot(hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x - hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP].x, hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y - hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP].y) < 0.07:
                         current_gesture = "OK"
 
+        # --- BARU: LOGIKA STABILITAS GESTURE (DEBOUNCE) ---
+        gesture_buffer.append(current_gesture)
+        
+        # Cek apakah 70% (atau 7 dari 10) frame terakhir adalah gesture yang sama
+        if gesture_buffer.count(current_gesture) > 7:
+            stable_gesture = current_gesture
+        # --------------------------------------------------
+
         # --- AMBIL KONFIGURASI & GAMBAR KARAKTER ---
-        config = GESTURE_CONFIG.get(current_gesture, GESTURE_CONFIG["NORMAL"])
+        # DIUBAH: Gunakan 'stable_gesture'
+        config = GESTURE_CONFIG.get(stable_gesture, GESTURE_CONFIG["NORMAL"])
         current_head_img = config["head"]
         current_body_img = config["body"]
         
-        ### DIUBAH: Gunakan variabel global ###
         offset_head_x, offset_head_y = GLOBAL_OFFSET_HEAD
         offset_body_x, offset_body_y = GLOBAL_OFFSET_BODY
 
@@ -236,7 +245,8 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
             pos_x_head = avg_x_head - (current_head_w // 2) + offset_head_x
             pos_y_head = avg_y_head - (current_head_h // 2) + offset_head_y
 
-            if current_gesture == "BLUSHING":
+            # DIUBAH: Gunakan 'stable_gesture' untuk urutan gambar
+            if stable_gesture == "BLUSHING":
                 frame = overlay_png(frame, current_head_img, pos_x_head, pos_y_head)
                 frame = overlay_png(frame, current_body_img, pos_x_body, pos_y_body)
             else:
