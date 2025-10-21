@@ -1,15 +1,11 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-from collections import deque # <-- BARU: Import library deque
+from collections import deque
+import math
 
 # --- FUNGSI UNTUK MENEMPELKAN GAMBAR PNG (DENGAN TRANSPARANSI) ---
-# Fungsi ini sudah bagus, tidak perlu diubah.
 def overlay_png(background, overlay, x, y):
-    """
-    Menempelkan gambar 'overlay' (dengan alpha channel) ke 'background'.
-    x, y adalah koordinat pojok kiri atas dari gambar overlay.
-    """
     bg_h, bg_w, _ = background.shape
     overlay_h, overlay_w, _ = overlay.shape
 
@@ -41,123 +37,214 @@ def overlay_png(background, overlay, x, y):
 
 # --- INISIALISASI MEDIAPIPE ---
 mp_holistic = mp.solutions.holistic
+mp_hands = mp.solutions.hands
 
 # --- MUAT SEMUA GAMBAR KARAKTER DAN SKALAKAN ---
 try:
+    # Aset Kepala (3)
     img_head_normal = cv2.imread('margo_head_normal.png', cv2.IMREAD_UNCHANGED)
+    img_head_blush = cv2.imread('margo_head_blush.png', cv2.IMREAD_UNCHANGED)
+    img_head_excited = cv2.imread('margo_head_excited.png', cv2.IMREAD_UNCHANGED) 
+    
+    # Aset Badan (7)
     img_body_normal = cv2.imread('margo_body_normal.png', cv2.IMREAD_UNCHANGED)
-    img_head_react = cv2.imread('margo_head_react.png', cv2.IMREAD_UNCHANGED)
-    img_body_react = cv2.imread('margo_body_react.png', cv2.IMREAD_UNCHANGED)
+    img_body_coverface = cv2.imread('margo_body_coverface.png', cv2.IMREAD_UNCHANGED)
+    img_body_peace = cv2.imread('margo_body_peace.png', cv2.IMREAD_UNCHANGED)
+    img_body_ok = cv2.imread('margo_body_ok.png', cv2.IMREAD_UNCHANGED)
+    img_body_wave = cv2.imread('margo_body_wave.png', cv2.IMREAD_UNCHANGED)
+    img_body_excited = cv2.imread('margo_body_excited.png', cv2.IMREAD_UNCHANGED)
+    img_body_thumbsup = cv2.imread('margo_body_thumbsup.png', cv2.IMREAD_UNCHANGED)
     
-    if any(img is None for img in [img_head_normal, img_body_normal, img_head_react, img_body_react]):
-        raise FileNotFoundError("Salah satu atau lebih file gambar tidak ditemukan.")
+    image_assets = [
+        img_head_normal, img_head_blush, img_head_excited, img_body_normal, img_body_coverface,
+        img_body_peace, img_body_ok, img_body_wave, img_body_excited, img_body_thumbsup
+    ]
+    if any(img is None for img in image_assets):
+        raise FileNotFoundError("Salah satu atau lebih file gambar tidak ditemukan! Cek kembali semua 10 nama file.")
     
-    # --- PENTING: FAKTOR SKALA ---
-    scale_factor_head = 0.45
-    scale_factor_body = 0.7 
+    scale_factor_head = 0.4
+    scale_factor_body = 0.5 
 
-    img_head_normal = cv2.resize(img_head_normal, (0,0), fx=scale_factor_head, fy=scale_factor_head, interpolation=cv2.INTER_AREA)
-    img_body_normal = cv2.resize(img_body_normal, (0,0), fx=scale_factor_body, fy=scale_factor_body, interpolation=cv2.INTER_AREA)
-    img_head_react = cv2.resize(img_head_react, (0,0), fx=scale_factor_head, fy=scale_factor_head, interpolation=cv2.INTER_AREA)
-    img_body_react = cv2.resize(img_body_react, (0,0), fx=scale_factor_body, fy=scale_factor_body, interpolation=cv2.INTER_AREA)
+    img_head_normal = cv2.resize(img_head_normal, (0,0), fx=scale_factor_head, fy=scale_factor_head)
+    img_head_blush = cv2.resize(img_head_blush, (0,0), fx=scale_factor_head, fy=scale_factor_head)
+    img_head_excited = cv2.resize(img_head_excited, (0,0), fx=scale_factor_head, fy=scale_factor_head)
+    img_body_normal = cv2.resize(img_body_normal, (0,0), fx=scale_factor_body, fy=scale_factor_body)
+    img_body_coverface = cv2.resize(img_body_coverface, (0,0), fx=scale_factor_body, fy=scale_factor_body)
+    img_body_peace = cv2.resize(img_body_peace, (0,0), fx=scale_factor_body, fy=scale_factor_body)
+    img_body_ok = cv2.resize(img_body_ok, (0,0), fx=scale_factor_body, fy=scale_factor_body)
+    img_body_wave = cv2.resize(img_body_wave, (0,0), fx=scale_factor_body, fy=scale_factor_body)
+    img_body_excited = cv2.resize(img_body_excited, (0,0), fx=scale_factor_body, fy=scale_factor_body)
+    img_body_thumbsup = cv2.resize(img_body_thumbsup, (0,0), fx=scale_factor_body, fy=scale_factor_body)
 
 except FileNotFoundError as e:
-    print(e)
-    print("Pastikan semua file gambar ('margo_head_normal.png', 'margo_body_normal.png', dll) ada di folder yang sama dengan script Python.")
+    print(f"Error: {e}")
     exit()
 
-# --- BUKA KAMERA & INISIALISASI MODEL HOLISTIC ---
-cap = cv2.VideoCapture(0)
+### BARU: PENGATURAN POSISI GLOBAL ###
+# Atur jarak kepala dan badan di sini. Ini akan berlaku untuk SEMUA gestur.
+# Format: (penyesuaian_x, penyesuaian_y)
+GLOBAL_OFFSET_HEAD = (0, 140)  # Geser kepala ke atas 20 piksel
+GLOBAL_OFFSET_BODY = (0, -20)  # Geser badan ke bawah 190 piksel
 
-# <-- BARU: BUAT PENYIMPANAN HISTORY UNTUK SMOOTHING -->
-# maxlen=5 berarti kita akan menyimpan & merata-ratakan 5 posisi terakhir
+
+# --- KONFIGURASI UNTUK SETIAP GESTUR ---
+# Sekarang hanya berisi aset gambar untuk setiap gestur.
+GESTURE_CONFIG = {
+    "NORMAL": {
+        "head": img_head_normal,
+        "body": img_body_normal
+        ### DIHAPUS: "offset_head" dan "offset_body"
+    },
+    "BLUSHING": {
+        "head": img_head_blush,
+        "body": img_body_coverface
+    },
+    "EXCITED": {
+        "head": img_head_excited,
+        "body": img_body_excited
+    },
+    "THUMBS_UP": {
+        "head": img_head_normal,
+        "body": img_body_thumbsup
+    },
+    "PEACE": {
+        "head": img_head_normal,
+        "body": img_body_peace
+    },
+    "OK": {
+        "head": img_head_normal,
+        "body": img_body_ok
+    },
+    "WAVE": {
+        "head": img_head_normal,
+        "body": img_body_wave
+    }
+}
+
+# --- FUNGSI BANTUAN DETEKSI GESTURE ---
+def get_finger_status(hand_landmarks):
+    status = {'THUMB': False, 'INDEX': False, 'MIDDLE': False, 'RING': False, 'PINKY': False}
+    if not hand_landmarks:
+        return status
+        
+    thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+    thumb_ip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_IP]
+    if thumb_tip.y < thumb_ip.y:
+        status['THUMB'] = True
+
+    finger_tips_ids = [mp_hands.HandLandmark.INDEX_FINGER_TIP, mp_hands.HandLandmark.MIDDLE_FINGER_TIP, 
+                       mp_hands.HandLandmark.RING_FINGER_TIP, mp_hands.HandLandmark.PINKY_TIP]
+    finger_pips_ids = [mp_hands.HandLandmark.INDEX_FINGER_PIP, mp_hands.HandLandmark.MIDDLE_FINGER_PIP, 
+                       mp_hands.HandLandmark.RING_FINGER_PIP, mp_hands.HandLandmark.PINKY_PIP]
+
+    for i, (tip_id, pip_id) in enumerate(zip(finger_tips_ids, finger_pips_ids)):
+        finger_name = list(status.keys())[i+1]
+        if hand_landmarks.landmark[tip_id].y < hand_landmarks.landmark[pip_id].y:
+            status[finger_name] = True
+    return status
+
+def is_fist(hand_landmarks):
+    if not hand_landmarks:
+        return False
+    finger_status = get_finger_status(hand_landmarks)
+    is_clenched = not any(finger_status.values())
+    return is_clenched
+
+# --- BUKA KAMERA & INISIALISASI ---
+cap = cv2.VideoCapture(0)
 history_head = deque(maxlen=5)
 history_body = deque(maxlen=5)
 
-with mp_holistic.Holistic(
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
-) as holistic:
-
+with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
 
         frame = cv2.flip(frame, 1)
         frame_h, frame_w, _ = frame.shape
-
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = holistic.process(image_rgb)
         
-        # --- LOGIKA UTAMA ---
+        current_gesture = "NORMAL"
+
         if results.pose_landmarks:
             pose = results.pose_landmarks.landmark
             
-            # 1. Tentukan status (Normal atau Bereaksi)
-            left_wrist = pose[mp_holistic.PoseLandmark.LEFT_WRIST]
-            right_wrist = pose[mp_holistic.PoseLandmark.RIGHT_WRIST]
-            nose = pose[mp_holistic.PoseLandmark.NOSE]
-            is_reacting = left_wrist.y < nose.y and right_wrist.y < nose.y
-
-            # 2. Pilih aset gambar yang sesuai dengan status
-            if is_reacting:
-                current_head_img = img_head_react
-                current_body_img = img_body_react
-            else:
-                current_head_img = img_head_normal
-                current_body_img = img_body_normal
+            if results.left_hand_landmarks and results.right_hand_landmarks:
+                left_wrist = pose[mp_holistic.PoseLandmark.LEFT_WRIST]
+                right_wrist = pose[mp_holistic.PoseLandmark.RIGHT_WRIST]
+                nose = pose[mp_holistic.PoseLandmark.NOSE]
                 
-            current_head_h, current_head_w, _ = current_head_img.shape
-            current_body_h, current_body_w, _ = current_body_img.shape
+                if left_wrist.y < nose.y and right_wrist.y < nose.y:
+                    if abs(left_wrist.x - right_wrist.x) < 0.3:
+                        current_gesture = "BLUSHING"
 
-            # --------------------------------------------------------------------
-            # ## PERHITUNGAN POSISI YANG SUDAH DIHALUSKAN (SMOOTHED) ##
-            
-            # 3.1 Dapatkan posisi mentah (RAW) dari landmark
-            raw_pos_head = (int(nose.x * frame_w), int(nose.y * frame_h))
+            if current_gesture == "NORMAL":
+                if is_fist(results.left_hand_landmarks) and is_fist(results.right_hand_landmarks):
+                    current_gesture = "EXCITED"
 
+            if current_gesture == "NORMAL":
+                is_waving = (results.right_hand_landmarks and pose[mp_holistic.PoseLandmark.RIGHT_WRIST].y < pose[mp_holistic.PoseLandmark.RIGHT_SHOULDER].y) or \
+                            (results.left_hand_landmarks and pose[mp_holistic.PoseLandmark.LEFT_WRIST].y < pose[mp_holistic.PoseLandmark.LEFT_SHOULDER].y)
+                
+                if is_waving:
+                    current_gesture = "WAVE"
+                
+                elif results.right_hand_landmarks:
+                    hand_landmarks = results.right_hand_landmarks
+                    finger_status = get_finger_status(hand_landmarks)
+                    
+                    if finger_status['THUMB'] and not finger_status['INDEX'] and not finger_status['MIDDLE']:
+                        current_gesture = "THUMBS_UP"
+                    elif finger_status['INDEX'] and finger_status['MIDDLE'] and not finger_status['RING']:
+                        current_gesture = "PEACE"
+                    elif math.hypot(hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x - hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP].x, hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y - hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP].y) < 0.07:
+                        current_gesture = "OK"
+
+        # --- AMBIL KONFIGURASI & GAMBAR KARAKTER ---
+        config = GESTURE_CONFIG.get(current_gesture, GESTURE_CONFIG["NORMAL"])
+        current_head_img = config["head"]
+        current_body_img = config["body"]
+        
+        ### DIUBAH: Gunakan variabel global ###
+        offset_head_x, offset_head_y = GLOBAL_OFFSET_HEAD
+        offset_body_x, offset_body_y = GLOBAL_OFFSET_BODY
+
+        # --- LOGIKA PENGGAMBARAN KARAKTER ---
+        if results.pose_landmarks:
+            pose = results.pose_landmarks.landmark
+            nose = pose[mp_holistic.PoseLandmark.NOSE]
             left_shoulder = pose[mp_holistic.PoseLandmark.LEFT_SHOULDER]
             right_shoulder = pose[mp_holistic.PoseLandmark.RIGHT_SHOULDER]
-            raw_pos_body = (
-                int((left_shoulder.x + right_shoulder.x) * frame_w / 2),
-                int((left_shoulder.y + right_shoulder.y) * frame_h / 2)
-            )
 
-            # 3.2 Simpan posisi mentah ke dalam history
+            raw_pos_head = (int(nose.x * frame_w), int(nose.y * frame_h))
+            raw_pos_body = (int((left_shoulder.x + right_shoulder.x) * frame_w / 2), int((left_shoulder.y + right_shoulder.y) * frame_h / 2))
+            
             history_head.append(raw_pos_head)
             history_body.append(raw_pos_body)
-
-            # 3.3 Hitung posisi RATA-RATA dari history
+            
             avg_x_head = sum(p[0] for p in history_head) // len(history_head)
             avg_y_head = sum(p[1] for p in history_head) // len(history_head)
             avg_x_body = sum(p[0] for p in history_body) // len(history_body)
             avg_y_body = sum(p[1] for p in history_body) // len(history_body)
 
-            # 3.4 Gunakan posisi RATA-RATA ini untuk menggambar
-            cx_head, cy_head = avg_x_head, avg_y_head
-            cx_shoulder_mid, cy_shoulder_mid = avg_x_body, avg_y_body
-            # --------------------------------------------------------------------
+            current_body_h, current_body_w, _ = current_body_img.shape
+            pos_x_body = avg_x_body - (current_body_w // 2) + offset_body_x
+            pos_y_body = avg_y_body - (current_body_h // 2) + offset_body_y
             
-            # ======== SESUAIKAN OFFSET INI UNTUK POSISI YANG PAS ========
-            offset_y_body = 180  # Geser badan ke atas/bawah
-            offset_y_head = -10  # Geser kepala ke atas/bawah agar pas dengan leher
-            # ==========================================================
-            
-            pos_x_body = cx_shoulder_mid - (current_body_w // 2)
-            pos_y_body = cy_shoulder_mid - (current_body_h // 2) + offset_y_body
+            current_head_h, current_head_w, _ = current_head_img.shape
+            pos_x_head = avg_x_head - (current_head_w // 2) + offset_head_x
+            pos_y_head = avg_y_head - (current_head_h // 2) + offset_head_y
 
-            pos_x_head = cx_head - (current_head_w // 2)
-            pos_y_head = cy_head - (current_head_h // 2) + offset_y_head
+            if current_gesture == "BLUSHING":
+                frame = overlay_png(frame, current_head_img, pos_x_head, pos_y_head)
+                frame = overlay_png(frame, current_body_img, pos_x_body, pos_y_body)
+            else:
+                frame = overlay_png(frame, current_body_img, pos_x_body, pos_y_body)
+                frame = overlay_png(frame, current_head_img, pos_x_head, pos_y_head)
 
-            # 4. Gambar Karakter ke Layar
-            frame = overlay_png(frame, current_body_img, pos_x_body, pos_y_body)
-            frame = overlay_png(frame, current_head_img, pos_x_head, pos_y_head)
-            
-        cv2.imshow('VTuber Margo Lengkap', frame)
-
-        if cv2.waitKey(5) & 0xFF in [ord('q'), 27]: # Keluar dengan 'q' atau 'ESC'
-            break
+        cv2.imshow('VTuber Margo Interaktif', frame)
+        if cv2.waitKey(5) & 0xFF in [ord('q'), 27]: break
 
 cap.release()
 cv2.destroyAllWindows()
