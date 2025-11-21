@@ -155,7 +155,7 @@ def get_aspect_ratio(face_landmarks, top_idx, bottom_idx, left_idx, right_idx):
     lm = face_landmarks.landmark
     def get_p(idx):
         try:
-            return (lm[idx].x, lm[idx].y) if idx < len(lm) and lm[idx].visibility > 0.1 else None
+            return (lm[idx].x, lm[idx].y) if idx < len(lm) else None
         except IndexError:
             return None
     top_p, bottom_p, left_p, right_p = get_p(top_idx), get_p(bottom_idx), get_p(left_idx), get_p(right_idx)

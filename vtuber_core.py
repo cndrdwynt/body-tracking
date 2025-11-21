@@ -12,7 +12,7 @@ from collections import deque
 # Import file konfigurasi kita
 import config as cfg
 # Import utils untuk fungsi pembantu
-from utils import get_finger_status
+from utils import get_finger_status, get_aspect_ratio
 
 mp_holistic = mp.solutions.holistic
 mp_hands = mp.solutions.hands
@@ -25,7 +25,6 @@ def load_assets():
     print("Memuat aset karakter...")
     all_loaded = True
     for name, filename in asset_files.items():
-        # Path sekarang menggunakan IMAGE_FOLDER dari config
         path = os.path.join(cfg.IMAGE_FOLDER, filename)
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         
@@ -62,10 +61,31 @@ def load_assets():
     if not all_loaded:
         raise FileNotFoundError("Aset karakter penting hilang/gagal.")
 
-    # --- MEMUAT BACKGROUND IMAGE SECARA TERPISAH ---
+    # ============= ASET MATA OVERLAY =============
+    print("Memuat aset mata overlay...")
+    for eye_name, eye_file in cfg.EYE_OVERLAY_FILES.items():
+        path = os.path.join(cfg.IMAGE_FOLDER, eye_file)
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        
+        if img is None:
+            print(f"Warn: '{eye_file}' tidak ditemukan, akan skip eye overlay")
+            assets[eye_name] = None
+        else:
+            try:
+                # Scale dengan HEAD_SCALE_FACTOR
+                scaled = cv2.resize(img, (0, 0), 
+                                    fx=cfg.HEAD_SCALE_FACTOR, 
+                                    fy=cfg.HEAD_SCALE_FACTOR, 
+                                    interpolation=cv2.INTER_AREA)
+                assets[eye_name] = scaled
+                print(f" - OK: {eye_file}")
+            except Exception as e:
+                print(f"Error resize '{eye_file}': {e}")
+                assets[eye_name] = None
+    # ===============================================
+
     print("Memuat aset background...")
     try:
-        # Path sekarang menggunakan BACKGROUND_FOLDER dari config
         bg_img_path = os.path.join(cfg.BACKGROUND_FOLDER, cfg.BG_VIRTUAL_IMAGE_PATH)
         bg_img = cv2.imread(bg_img_path)
         if bg_img is None:
@@ -77,7 +97,6 @@ def load_assets():
     except Exception as e:
         print(f"Error load BG image: {e}")
         assets['bg_virtual_img'] = None
-    # --- AKHIR BLOK ---
 
     # Membuat Map Variasi Kepala
     assets['head_variations'] = {}
@@ -107,43 +126,66 @@ def load_assets():
     print("Aset selesai diproses.")
     return assets
 
-def update_idle_state(state):
-    """Update state idle."""
-    if state["user_is_idle"]:
-        state["idle_timer"] -= 1
-        if state["idle_timer"] <= 0:
-            state["idle_sequence_index"] = (state["idle_sequence_index"] + 1) % len(cfg.IDLE_SEQUENCE)
-            next_s = cfg.IDLE_SEQUENCE[state["idle_sequence_index"]]
-            
-            if state["stable_gesture"] in ["NORMAL", "LOOK_LEFT_IDLE", "LOOK_RIGHT_IDLE", "LOOK_DOWN_IDLE"]:
-                state["stable_gesture"] = next_s
-            
-            min_d, max_d = cfg.IDLE_STATE_DURATION_RANGES.get(next_s, (cfg.IDLE_LOOK_DURATION_MIN_FRAMES, cfg.IDLE_LOOK_DURATION_MAX_FRAMES))
-            state["idle_timer"] = random.randint(min_d, max_d)
-    else:
+def update_unified_idle_state(state):
+    """
+    Update state idle terpadu (menggantikan update_idle_state dan update_eye_idle_state).
+    Akan bergantian antara idle "BODY" (tengok kepala) dan "EYES" (lirik pupil).
+    CATATAN: Logika idle BODY TENGOK KEPALA TELAH DIHAPUS dan digantikan oleh deteksi arah wajah.
+    """
+    
+    # 1. Handle Reset (jika user tidak idle)
+    if not state["user_is_idle"]:
+        # Reset timer utama
         state["idle_timer"] = random.randint(cfg.INITIAL_IDLE_DELAY_MIN_FRAMES, cfg.INITIAL_IDLE_DELAY_MAX_FRAMES)
-        state["idle_sequence_index"] = -1
+        # Selalu mulai dari mode EYES
+        state["idle_mode"] = "EYES" 
+        state["idle_sequence_index"] = -1 # Akan di-increment ke 0 saat idle pertama
+        # Reset semua state ke default
+        state["current_eye_direction"] = "CENTER"
         state["current_idle_offset_for_sway"] = (0, 0)
         return
-    
+
+    # 2. Handle Sway (body sway SANGAT kecil)
     target_o = (0, 0)
-    cs = state["stable_gesture"]
-    if cs == "LOOK_LEFT_IDLE":
-        target_o = (-cfg.IDLE_SWAY_TARGET_OFFSET, 0)
-    elif cs == "LOOK_RIGHT_IDLE":
-        target_o = (cfg.IDLE_SWAY_TARGET_OFFSET, 0)
-    elif cs == "LOOK_DOWN_IDLE":
-        target_o = (0, cfg.IDLE_SWAY_TARGET_OFFSET)
     
     cx, cy = state["current_idle_offset_for_sway"]
     tx, ty = target_o
     nx = int(cx * (1.0 - cfg.IDLE_SWAY_SPRING_FACTOR) + tx * cfg.IDLE_SWAY_SPRING_FACTOR)
     ny = int(cy * (1.0 - cfg.IDLE_SWAY_SPRING_FACTOR) + ty * cfg.IDLE_SWAY_SPRING_FACTOR)
-    
-    nx = max(-30, min(30, nx))
-    ny = max(-30, min(30, ny))
-    
     state["current_idle_offset_for_sway"] = (nx, ny)
+
+
+    # 3. Decrement Timer
+    state["idle_timer"] -= 1
+
+    # 4. Check Timer Expiry (jika timer habis, ganti ke aksi idle berikutnya)
+    if state["idle_timer"] <= 0:
+        current_mode = state.get("idle_mode", "EYES")
+        
+        # Di sini, kita hanya fokus ke mode EYES. Mode BODY idle sudah dihapus.
+        if current_mode == "EYES":
+            # Kita ada di mode EYES, jalankan sequence EYES (lirik pupil)
+            state["idle_sequence_index"] = (state["idle_sequence_index"] + 1)
+            
+            if state["idle_sequence_index"] >= len(cfg.EYE_IDLE_SEQUENCE):
+                # Sequen EYES selesai, ulangi sequence EYES setelah delay
+                # Kita tidak kembali ke mode "BODY" lagi
+                state["idle_mode"] = "EYES"
+                state["idle_sequence_index"] = 0 # Mulai dari awal sequence EYES
+                state["current_eye_direction"] = "CENTER" # Pastikan mata normal
+                
+                # Atur timer untuk delay sebelum idle eye berikutnya
+                state["idle_timer"] = random.randint(cfg.EYE_IDLE_DELAY_MIN_FRAMES, cfg.EYE_IDLE_DELAY_MAX_FRAMES)
+            else:
+                # Masih di sequence EYES
+                next_eye_dir = cfg.EYE_IDLE_SEQUENCE[state["idle_sequence_index"]]
+                state["current_eye_direction"] = next_eye_dir
+                # Atur timer untuk aksi mata ini
+                if next_eye_dir == "CENTER":
+                    state["idle_timer"] = cfg.EYE_RETURN_TO_CENTER_FRAMES
+                else:
+                    state["idle_timer"] = random.randint(cfg.EYE_LOOK_DURATION_MIN_FRAMES, cfg.EYE_LOOK_DURATION_MAX_FRAMES)
+
 
 def process_audio(state, stream):
     """Proses audio, update state dengan lip sync detection."""
@@ -175,7 +217,7 @@ def process_audio(state, stream):
                 else:
                     state["silence_frame_counter"] = 0
                     is_talking = True
-                    state["user_is_idle"] = False
+                    #state["user_is_idle"] = False
                     
                     if smoothed_rms < cfg.AUDIO_RMS_LEVEL_SMALL:
                         state["target_mouth_state"] = "small"
@@ -201,7 +243,7 @@ def process_audio(state, stream):
                 if state["laugh_audio_counter"] > cfg.LAUGH_COUNTER_THRESHOLD:
                     is_laugh_detected = True
                     is_talking = False
-                    state["user_is_idle"] = False
+                    #state["user_is_idle"] = False
                     audio_level = "KETAWA!"
 
                 state["current_audio_level"] = audio_level
@@ -227,103 +269,199 @@ def process_audio(state, stream):
 
     return is_talking, is_laugh_detected, stream
 
+def detect_face_direction(results):
+    """
+    Mendeteksi arah tengok kepala berdasarkan posisi hidung (NOSE) relatif terhadap bahu (SHOULDER).
+    Mengembalikan: "LOOK_LEFT_IDLE", "LOOK_RIGHT_IDLE", "LOOK_DOWN_IDLE", atau None.
+    """
+    pose_ok = results and results.pose_landmarks and hasattr(results.pose_landmarks, 'landmark')
+    if not pose_ok:
+        return None
+    
+    pose = results.pose_landmarks.landmark
+    
+    try:
+        nose = pose[mp_holistic.PoseLandmark.NOSE]
+        left_shoulder = pose[mp_holistic.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = pose[mp_holistic.PoseLandmark.RIGHT_SHOULDER]
+        
+        # Periksa visibilitas
+        if nose.visibility < 0.5 or left_shoulder.visibility < 0.5 or right_shoulder.visibility < 0.5:
+            return None
+        
+        # Hitung titik tengah bahu
+        shoulder_mid_x = (left_shoulder.x + right_shoulder.x) / 2
+        
+        # Perbedaan horizontal (X) antara hidung dan titik tengah bahu
+        diff_x = nose.x - shoulder_mid_x
+        
+        # Deteksi tengok kiri/kanan
+        if diff_x > cfg.FACE_DIRECTION_THRESHOLD:
+            # Hidung lebih ke kanan dari bahu -> user menghadap ke kiri (di kamera)
+            print("👁️  LOOK_LEFT_IDLE DETECTED (Face Direction)")
+            return "LOOK_LEFT_IDLE"
+        elif diff_x < -cfg.FACE_DIRECTION_THRESHOLD:
+            # Hidung lebih ke kiri dari bahu -> user menghadap ke kanan (di kamera)
+            print("👁️  LOOK_RIGHT_IDLE DETECTED (Face Direction)")
+            return "LOOK_RIGHT_IDLE"
+
+        # Deteksi tengok bawah (diabaikan dulu, fokus ke kiri/kanan lebih akurat)
+        # diff_y = nose.y - left_shoulder.y
+        # if diff_y > 0.05:
+        #    print("👁️  LOOK_DOWN_IDLE DETECTED (Face Direction)")
+        #    return "LOOK_DOWN_IDLE"
+
+    except (IndexError, AttributeError) as e:
+        print(f"[ERROR] Face Direction: {e}")
+        return None
+
+    return None
+
 def detect_gestures(state, results):
-    """Deteksi gesture."""
+    """
+    Deteksi gesture dengan logika STRICT:
+    - Wave: 1 Tangan diatas bahu (strict).
+    - Blushing: Tangan menyilang.
+    - OK: Telunjuk Tekuk + 3 Jari Lain Lurus (SIMPLE LOGIC).
+    """
     gesture = "NORMAL"
+    
     pose_ok = results and results.pose_landmarks and hasattr(results.pose_landmarks, 'landmark')
     
     if pose_ok:
         pose = results.pose_landmarks.landmark
+        left_h = results.left_hand_landmarks
+        right_h = results.right_hand_landmarks
+        
+        # Cek keberadaan tangan
+        left_ok = left_h and hasattr(left_h, 'landmark')
+        right_ok = right_h and hasattr(right_h, 'landmark')
+
+        # Cek Idle (Hidung)
         try:
             if pose[mp_holistic.PoseLandmark.NOSE].visibility < 0.5:
                 state["user_is_idle"] = False
         except IndexError:
             state["user_is_idle"] = False
 
-        left_h, right_h = results.left_hand_landmarks, results.right_hand_landmarks
-        left_ok, right_ok = left_h and hasattr(left_h, 'landmark'), right_h and hasattr(right_h, 'landmark')
-
         try:
-            if left_ok and right_ok:
-                lw = pose[mp_holistic.PoseLandmark.LEFT_WRIST]
-                rw = pose[mp_holistic.PoseLandmark.RIGHT_WRIST]
-                n = pose[mp_holistic.PoseLandmark.NOSE]
-                if lw.visibility > 0.5 and rw.visibility > 0.5 and n.visibility > 0.5 and lw.y < n.y and rw.y < n.y and abs(lw.x - rw.x) < cfg.GESTURE_BLUSH_WRIST_DISTANCE_THRESHOLD:
-                    gesture = "BLUSHING"
+            # Ambil Landmark Penting
+            rw_lm = pose[mp_holistic.PoseLandmark.RIGHT_WRIST]
+            rs_lm = pose[mp_holistic.PoseLandmark.RIGHT_SHOULDER]
+            lw_lm = pose[mp_holistic.PoseLandmark.LEFT_WRIST]
+            ls_lm = pose[mp_holistic.PoseLandmark.LEFT_SHOULDER]
+            nose_lm = pose[mp_holistic.PoseLandmark.NOSE]
 
+            # --- 1. CEK POSISI TANGAN (NAIK / TURUN) ---
+            r_is_up = rw_lm.visibility > 0.5 and rs_lm.visibility > 0.5 and rw_lm.y < rs_lm.y
+            l_is_up = lw_lm.visibility > 0.5 and ls_lm.visibility > 0.5 and lw_lm.y < ls_lm.y
+
+            # --- 2. DETEKSI BLUSHING (PRIORITAS TERTINGGI) ---
+            wrists_crossed = False
+            if rw_lm.visibility > 0.5 and lw_lm.visibility > 0.5:
+                wrist_dist = abs(rw_lm.x - lw_lm.x)
+                near_nose = rw_lm.y < nose_lm.y + 0.1 and lw_lm.y < nose_lm.y + 0.1
+                if wrist_dist < 0.15 and near_nose:
+                    wrists_crossed = True
+
+            if wrists_crossed:
+                gesture = "BLUSHING"
+                print("✅ BLUSHING DETECTED! (Tangan Menyilang)")
+
+            # --- 3. DETEKSI WAVE vs EXCITED ---
             if gesture == "NORMAL":
-                rw_lm = pose[mp_holistic.PoseLandmark.RIGHT_WRIST]
-                rs_lm = pose[mp_holistic.PoseLandmark.RIGHT_SHOULDER]
-                lw_lm = pose[mp_holistic.PoseLandmark.LEFT_WRIST]
-                ls_lm = pose[mp_holistic.PoseLandmark.LEFT_SHOULDER]
+                # Cek Jari Terbuka (Open Palm)
+                r_is_open = False
+                l_is_open = False
+                if right_ok:
+                    r_stat = get_finger_status(right_h)
+                    r_is_open = r_stat['INDEX'] and r_stat['MIDDLE'] and r_stat['RING'] and r_stat['PINKY']
+                if left_ok:
+                    l_stat = get_finger_status(left_h)
+                    l_is_open = l_stat['INDEX'] and l_stat['MIDDLE'] and l_stat['RING'] and l_stat['PINKY']
 
-                r_wave = right_ok and rw_lm.visibility > 0.5 and rs_lm.visibility > 0.5 and rw_lm.y < rs_lm.y
-                l_wave = left_ok and lw_lm.visibility > 0.5 and ls_lm.visibility > 0.5 and lw_lm.y < ls_lm.y
-                
-                if r_wave and l_wave:
+                if r_is_up and l_is_up:
                     gesture = "EXCITED"
-                elif r_wave or l_wave:
+                    print("✅ EXCITED DETECTED! (Dua Tangan Naik)")
+                elif (r_is_up and r_is_open and not l_is_up):
                     gesture = "WAVE"
+                    print("👋 WAVE DETECTED! (Hanya Tangan Kanan)")
+                elif (l_is_up and l_is_open and not r_is_up):
+                    gesture = "WAVE"
+                    print("👋 WAVE DETECTED! (Hanya Tangan Kiri)")
+
+            # --- 4. DETEKSI JARI (THUMBS UP, PEACE, OK) ---
+            # Hanya dijalankan jika tangan TIDAK diatas bahu (Gesture Normal)
+            if gesture == "NORMAL":
+                
+                # Fungsi helper lokal untuk cek jari
+                def check_finger_gesture(hand_landmarks):
+                    fs = get_finger_status(hand_landmarks)
                     
-                elif right_ok:
-                    finger_status = get_finger_status(right_h)
-                    
-                    try:
-                        thumb_tip = right_h.landmark[mp_hands.HandLandmark.THUMB_TIP]
-                        index_tip = right_h.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                    # A. THUMBS UP: Jempol Lurus, SISANYA TEKUK
+                    if fs['THUMB'] and \
+                       not fs['INDEX'] and not fs['MIDDLE'] and \
+                       not fs['RING'] and not fs['PINKY']:
+                        return "THUMBS_UP"
+
+                    # B. PEACE: Telunjuk & Tengah Lurus, Sisanya Tekuk
+                    if fs['INDEX'] and fs['MIDDLE'] and \
+                       not fs['RING'] and not fs['PINKY']:
+                        return "PEACE"
+
+                    # C. OK (VERSI SIMPLE)
+                    # Telunjuk DITEKUK, 3 Jari Lain LURUS
+                    if not fs['INDEX'] and \
+                       fs['MIDDLE'] and fs['RING'] and fs['PINKY']:
+                        return "OK"
                         
-                        distance = math.hypot(
-                            index_tip.x - thumb_tip.x,
-                            index_tip.y - thumb_tip.y
-                        )
-                        
-                        if distance < cfg.GESTURE_OK_DISTANCE_THRESHOLD:
-                            gesture = "OK"
-                        
-                        elif finger_status['THUMB'] and not finger_status['INDEX'] and not finger_status['MIDDLE']:
-                            gesture = "THUMBS_UP"
-                        
-                        elif finger_status['INDEX'] and finger_status['MIDDLE'] and not finger_status['RING']:
-                            gesture = "PEACE"
+                    return None
+
+                # Cek Tangan Kanan
+                if right_ok:
+                    g = check_finger_gesture(right_h)
+                    if g:
+                        gesture = g
+                        print(f"✅ {g} DETECTED! (Right Hand)")
+                
+                # Cek Tangan Kiri (Fallback)
+                elif left_ok:
+                    g = check_finger_gesture(left_h)
+                    if g:
+                        gesture = g
+                        print(f"✅ {g} DETECTED! (Left Hand)")
                             
-                    except (IndexError, AttributeError) as e:
-                        print(f"  [ERROR] Error saat cek gesture jari: {e}")
-
-        except IndexError: pass
+        except (IndexError, AttributeError) as e:
+            print(f"[ERROR] Gesture Logic: {e}")
         except Exception as e:
-            print(f"Error saat deteksi gesture (umum): {e}")
+            print(f"Error gesture umum: {e}")
     else:
         state["user_is_idle"] = False
 
+    # --- PROSES BUFFER ---
     state["gesture_buffer"].append(gesture)
-    final_gesture = "NORMAL"
-    
     if len(state["gesture_buffer"]) == cfg.GESTURE_BUFFER_SIZE:
-        mcg = max(set(state["gesture_buffer"]), key=state["gesture_buffer"].count)
-        count = state["gesture_buffer"].count(mcg)
+        counts = {}
+        for g in state["gesture_buffer"]:
+            counts[g] = counts.get(g, 0) + 1
+        current_stable = state.get("stable_gesture", "NORMAL")
+        most_common = max(counts, key=counts.get)
         
-        if count >= cfg.GESTURE_CONFIRMATION_THRESHOLD and mcg != "NORMAL":
-            final_gesture = mcg
-            state["user_is_idle"] = False
-        elif state["gesture_buffer"].count("NORMAL") < (cfg.GESTURE_BUFFER_SIZE - cfg.GESTURE_CONFIRMATION_THRESHOLD + 1):
-            state["user_is_idle"] = False
-    else:
-        state["user_is_idle"] = False
+        if counts[most_common] >= cfg.GESTURE_CONFIRMATION_THRESHOLD:
+             if not most_common.startswith("LOOK_"): 
+                state["stable_gesture"] = most_common
+        elif current_stable not in ["NORMAL", "LAUGH"] and counts.get("NORMAL", 0) >= cfg.GESTURE_CONFIRMATION_THRESHOLD:
+             state["stable_gesture"] = "NORMAL"
 
     if not state["user_is_idle"]:
-        cs = state["stable_gesture"]
-        is_idle = cs in ["NORMAL", "LOOK_LEFT_IDLE", "LOOK_RIGHT_IDLE", "LOOK_DOWN_IDLE"]
-        new_g = final_gesture if final_gesture != "NORMAL" else "NORMAL"
-        if new_g != cs or not is_idle:
-            state["stable_gesture"] = new_g
-            state["idle_timer"] = random.randint(cfg.INITIAL_IDLE_DELAY_MIN_FRAMES, cfg.INITIAL_IDLE_DELAY_MAX_FRAMES)
-            state["idle_sequence_index"] = -1
+        state["stable_gesture"] = gesture
 
 def determine_blink_state(state, results, get_aspect_ratio_func):
     """Deteksi kedip."""
     is_blinking = False
     if results and results.face_landmarks:
         face_lm = results.face_landmarks
+        # Menggunakan landmark wajah yang lebih stabil untuk deteksi mata
         le = get_aspect_ratio_func(face_lm, 386, 374, 362, 263)
         re = get_aspect_ratio_func(face_lm, 159, 145, 133, 33)
         if le > 1e-6 and re > 1e-6 and (le + re) / 2.0 < cfg.EYE_AR_THRESHOLD:
@@ -346,16 +484,21 @@ def determine_blink_state(state, results, get_aspect_ratio_func):
     return is_blinking, force_blink
 
 def select_assets(state, assets, is_blinking, force_blink, is_talking, is_laugh_detected):
-    """Pilih aset kepala & badan dengan advanced lip sync."""
+    """Pilih aset kepala & badan dengan SMOOTH lip sync transition + EYE OVERLAY."""
+    
+    # Ambil gesture stabil saat ini, atau set ke NORMAL jika tidak ada
     sg = state["stable_gesture"]
     if sg not in assets['gesture_config']:
         sg = "NORMAL"
         state["stable_gesture"] = "NORMAL"
+
+    # Force LAUGH jika terdeteksi
     if is_laugh_detected:
         sg = "LAUGH"
         state["random_blink_counter"] = 0
         state["talk_frame_counter"] = 0
 
+    # Ambil konfigurasi aset (head/body)
     cfg_assets = assets['gesture_config'].get(sg, assets['gesture_config']["NORMAL"])
     body_img, base_head = cfg_assets.get("body"), cfg_assets.get("head")
     
@@ -370,11 +513,15 @@ def select_assets(state, assets, is_blinking, force_blink, is_talking, is_laugh_
     final_head = base_head
     variations = assets['head_variations'].get(id(base_head))
 
+    # --- LOGIKA PILIH HEAD ASSET ---
     if is_laugh_detected:
         final_head = assets.get("head_laugh", base_head)
+        state["current_mouth_state"] = "laugh"
     elif sg == "EXCITED":
         final_head = assets.get("head_excited", base_head)
+        state["current_mouth_state"] = "excited"
     elif (is_blinking or force_blink):
+        # Kedip
         blink = variations.get("blink") if variations else None
         if blink is not None:
             final_head = blink
@@ -382,23 +529,81 @@ def select_assets(state, assets, is_blinking, force_blink, is_talking, is_laugh_
             fallback_blink = assets.get("head_blush_blink") if sg == "BLUSHING" and assets.get("head_blush_blink") is not None else assets.get("head_normal_blink")
             if fallback_blink is not None:
                 final_head = fallback_blink
-    elif is_talking and sg == "NORMAL" and variations:
+    elif sg in ["LOOK_LEFT_IDLE", "LOOK_RIGHT_IDLE", "LOOK_DOWN_IDLE"]:
+        # Gunakan aset kepala tengok yang terdeteksi
+        pass # final_head sudah diset di atas dari cfg_assets
+    elif variations:
+        # ===================================================================
+        # SMOOTH MOUTH TRANSITION SYSTEM (Hanya untuk kepala 'head_normal')
+        # ===================================================================
         target_state = state.get("target_mouth_state", "closed")
-        mouth_img = variations.get(target_state)
+        current_state = state.get("current_mouth_state", "closed")
+        
+        # Definisikan urutan state mulut (dari paling kecil ke besar)
+        mouth_sequence = ["closed", "small", "medium", "wide", "o"]
+        
+        try:
+            target_idx = mouth_sequence.index(target_state)
+            current_idx = mouth_sequence.index(current_state)
+        except ValueError:
+            target_idx = 0
+            current_idx = 0
+        
+        # Transisi bertahap (naik/turun 1 step per frame)
+        if current_idx < target_idx:
+            new_idx = current_idx + 1
+        elif current_idx > target_idx:
+            new_idx = current_idx - 1
+        else:
+            new_idx = current_idx
+        
+        # Update current state
+        new_state = mouth_sequence[new_idx]
+        state["current_mouth_state"] = new_state
+        
+        # Ambil asset sesuai state baru
+        mouth_img = variations.get(new_state)
         if mouth_img is not None:
             final_head = mouth_img
-            state["current_mouth_state"] = target_state
         else:
             closed_img = variations.get("closed")
-            if closed_img is not None:
-                final_head = closed_img
-            else:
-                final_head = base_head
-    elif not is_talking and sg == "NORMAL" and variations:
-        closed_img = variations.get("closed")
-        if closed_img is not None:
-            final_head = closed_img
-            state["current_mouth_state"] = "closed"
+            final_head = closed_img if closed_img is not None else base_head
+        
+        # Debug (opsional, bisa dimatikan)
+        # if target_state != current_state:
+        #     print(f"[SMOOTH MOUTH] {current_state} -> {new_state} (target: {target_state})")
+
+
+    # ============= LOGIKA EYE OVERLAY =============
+    selected_eyes = None
+    eye_direction = state.get("current_eye_direction", "CENTER")
+    
+    if is_blinking or force_blink:
+        # Saat blink, TIDAK TAMPILKAN MATA (None)
+        selected_eyes = None
+    elif is_laugh_detected or sg == "LAUGH":
+        # Saat ketawa, mata normal (jika ada overlay)
+        selected_eyes = assets.get("eyes_normal")
+    elif sg in ["LOOK_LEFT_IDLE", "LOOK_RIGHT_IDLE", "LOOK_DOWN_IDLE"]:
+        # Saat gestur tengok/nunduk, JANGAN gunakan eye overlay (karena aset kepala sudah 'tengok')
+        selected_eyes = None
+    else:
+        # JIKA gestur NORMAL/lainnya, baru kita pakai lirikan mata (idle/tengah)
+        if eye_direction == "LEFT":
+            selected_eyes = assets.get("eyes_look_left")
+        elif eye_direction == "RIGHT":
+            selected_eyes = assets.get("eyes_look_right")
+        else:  # CENTER atau state lainnya
+            selected_eyes = assets.get("eyes_normal")
+    
+    # Fallback jika asset tidak ada
+    if selected_eyes is None and not (is_blinking or force_blink or sg in ["LOOK_LEFT_IDLE", "LOOK_RIGHT_IDLE", "LOOK_DOWN_IDLE"]):
+         # (Jangan fallback ke mata normal jika memang sengaja di-set None oleh gestur tengok)
+        selected_eyes = assets.get("eyes_normal")
+    
+    # Simpan ke state untuk digunakan saat rendering
+    state["current_eyes"] = selected_eyes
+    # ======================================================
 
     if final_head is None: final_head = assets.get("head_normal")
     if body_img is None: body_img = assets.get("body_normal")
@@ -499,3 +704,37 @@ def calculate_positions(state, results, frame_w, frame_h, current_head_img, curr
         pxhr += shx
 
     return int(pxh), int(pyh), int(pxb), int(pyb), int(pxhr), int(pyhr) 
+
+def calculate_visual_lip_sync(results):
+    """
+    Menghitung rasio mulut dari landmark visual dan menentukan state-nya.
+    DENGAN SMOOTHING untuk mengurangi jitter.
+    """
+    current_mouth_ratio = 0.0
+    visual_mouth_state = "closed"
+
+    if results and results.face_landmarks:
+        face_lm = results.face_landmarks
+        
+        ratio = get_aspect_ratio(face_lm, 
+                                 cfg.MOUTH_LANDMARK_UPPER,
+                                 cfg.MOUTH_LANDMARK_LOWER,
+                                 cfg.MOUTH_LANDMARK_LEFT,
+                                 cfg.MOUTH_LANDMARK_RIGHT)
+        
+        current_mouth_ratio = ratio
+
+        # Tentukan state berdasarkan threshold dengan HYSTERESIS
+        # (menambah sedikit "dead zone" untuk mencegah flicker)
+        if ratio > cfg.MOUTH_OPENNESS_THRESHOLD_O + 0.05:
+            visual_mouth_state = "o"
+        elif ratio > cfg.MOUTH_OPENNESS_THRESHOLD_WIDE + 0.03:
+            visual_mouth_state = "wide"
+        elif ratio > cfg.MOUTH_OPENNESS_THRESHOLD_MEDIUM + 0.02:
+            visual_mouth_state = "medium"
+        elif ratio > cfg.MOUTH_OPENNESS_THRESHOLD_SMALL + 0.01:
+            visual_mouth_state = "small"
+        else:
+            visual_mouth_state = "closed"
+    
+    return visual_mouth_state, current_mouth_ratio

@@ -64,14 +64,18 @@ def draw_background(state, frame_w, frame_h, cap_bg, bg_virtual_img):
 def draw_avatar_and_ui(final_output, state, assets, current_head_img, current_body_img,
                          pos_x_head, pos_y_head, pos_x_body, pos_y_body,
                          pos_x_hair, pos_y_hair):
-    """Gambar rambut, avatar, UI."""
+    """Gambar rambut, avatar, UI, dan EYES OVERLAY."""
     temp_output = final_output.copy()
+    
+    # 1. Draw hair back
     hair_img = assets.get("hair_back")
     if hair_img is not None:
         temp_output = overlay_png(temp_output, hair_img, pos_x_hair, pos_y_hair)
         
+    # 2. Draw body & head (urutan tergantung gesture)
     body_drawn, head_drawn = False, False
     if state["stable_gesture"] == "BLUSHING":
+        # Head first untuk BLUSHING
         if current_head_img is not None:
             temp_output = overlay_png(temp_output, current_head_img, pos_x_head, pos_y_head)
             head_drawn = True
@@ -79,13 +83,32 @@ def draw_avatar_and_ui(final_output, state, assets, current_head_img, current_bo
             temp_output = overlay_png(temp_output, current_body_img, pos_x_body, pos_y_body)
             body_drawn = True
     else:
+        # Body first untuk gesture lain
         if current_body_img is not None:
             temp_output = overlay_png(temp_output, current_body_img, pos_x_body, pos_y_body)
             body_drawn = True
         if current_head_img is not None:
             temp_output = overlay_png(temp_output, current_head_img, pos_x_head, pos_y_head)
             head_drawn = True
-            
+    
+    # ============= TAMBAHKAN: Draw EYES OVERLAY =============
+    current_eyes = state.get("current_eyes")
+    
+    # EYES OVERLAY hanya digambar jika head_drawn (kepala terlihat) DAN
+    # jika gesture saat ini BUKAN gesture tengok/nunduk (karena aset kepala sudah menangani hal itu)
+    # CATATAN: Check ini juga dilakukan di select_assets, tapi check ini memastikan
+    # lapisan overlay hanya digambar di atas kepala 'NORMAL'
+    if current_eyes is not None and head_drawn and \
+       state["stable_gesture"] not in ["LOOK_LEFT_IDLE", "LOOK_RIGHT_IDLE", "LOOK_DOWN_IDLE"]:
+        
+        # Hitung posisi mata (sama dengan posisi head + offset)
+        eye_x = pos_x_head + cfg.EYE_OFFSET_X
+        eye_y = pos_y_head + cfg.EYE_OFFSET_Y
+        
+        # Overlay mata di atas head
+        temp_output = overlay_png(temp_output, current_eyes, eye_x, eye_y)
+    # =======================================================
+        
     if temp_output is not None:
         final_output = temp_output
     

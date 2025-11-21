@@ -1,5 +1,5 @@
 # main.py
-# File utama untuk menjalankan aplikasi VTuber.
+# File utama untuk menjalankan aplikasi VTuber dengan DEBUG MOUTH DETECTION
 
 import cv2
 import mediapipe as mp
@@ -19,7 +19,7 @@ from utils import *
 from vtuber_core import *
 from renderer import *
 
-# --- INISIALISASI MEDIAPIPE ---
+# ... (Fungsi initialize_systems() tidak berubah) ...
 try:
     mp_drawing = mp.solutions.drawing_utils
     mp_holistic = mp.solutions.holistic
@@ -143,8 +143,11 @@ def initialize_systems():
 
     return cap, stream, audio_system, holistic, cap_bg, cap_effect_excited, cap_effect_laugh, cap_effect_thumbsup, frame_h, frame_w
 
+# ============================================
+# FUNGSI INI DIUBAH
+# ============================================
 def initialize_state(frame_w, frame_h):
-    """Inisialisasi state termasuk effect state."""
+    """Inisialisasi state termasuk effect state dan UNIFIED IDLE STATE."""
     state = {
         "frame_counter": 0,
         "stable_gesture": "NORMAL",
@@ -161,9 +164,16 @@ def initialize_state(frame_w, frame_h):
         "hair_velocity": (0, 0),
         "bounce_offset": (0, 0),
         "bounce_velocity": (0, 0),
+        
+        # --- UNIFIED IDLE STATE ---
         "idle_timer": random.randint(cfg.INITIAL_IDLE_DELAY_MIN_FRAMES, cfg.INITIAL_IDLE_DELAY_MAX_FRAMES),
-        "idle_sequence_index": -1,
+        "idle_sequence_index": -1, # Index untuk sequence yg aktif
+        "idle_mode": "EYES",       # Mode idle: "EYES"
         "current_idle_offset_for_sway": (0, 0),
+        "current_eye_direction": "CENTER", # State untuk mata
+        "current_eyes": None,      # Menyimpan asset mata yang sedang digunakan
+        # --------------------------
+
         "frame_count_for_process": 0,
         "last_mediapipe_results": None,
         "effect_excited_active": False,
@@ -176,7 +186,10 @@ def initialize_state(frame_w, frame_h):
         "silence_frame_counter": 0,
         "last_rms_value": 0,
         "current_rms": 0,
-        "current_audio_level": "DIAM"
+        "current_audio_level": "DIAM",
+        "visual_laugh_duration_counter": 0,
+        "laugh_cooldown_counter": 0,
+        "face_direction_gesture": "NORMAL", # State tambahan untuk deteksi arah wajah
     }
     print("State OK.")
     return state
@@ -196,6 +209,15 @@ def main():
         
         state = initialize_state(frame_w, frame_w)
 
+        print("\n" + "="*60)
+        print("🔍 DEBUG MODE: MOUTH DETECTION ACTIVE")
+        print("="*60)
+        print("Lihat console untuk serial monitor output!")
+        print("="*60 + "\n")
+        
+        # Variabel ini tidak lagi digunakan untuk output, tetapi disimpan sebagai placeholder
+        raw_frame_for_mediapipe = None 
+
         while cap.isOpened():
             try:
                 ret, frame = cap.read()
@@ -206,7 +228,11 @@ def main():
                     print("Warn: Invalid frame.")
                     time.sleep(0.1)
                     continue
-                frame = cv2.flip(frame, 1)
+                
+                # Simpan frame asli (meskipun tidak ditampilkan, deteksi MP di bawah memerlukannya)
+                raw_frame_for_mediapipe = frame.copy() 
+                
+                frame = cv2.flip(frame, 1) # Frame yang di-flip untuk avatar
                 state["frame_counter"] += 1
                 new_h, new_w, _ = frame.shape
                 if new_h != frame_h or new_w != frame_w:
@@ -219,15 +245,17 @@ def main():
 
             state["user_is_idle"] = True
             
-            # --- PANGGIL LOGIKA DARI vtuber_core ---
-            is_talking, is_laugh_detected, stream = process_audio(state, stream)
+            # ... (Audio processing tidak berubah) ...
+            is_talking_audio, is_audio_laugh_detected, stream = process_audio(state, stream)
 
+            # ... (MediaPipe processing tidak berubah) ...
             results = None
             state["frame_count_for_process"] += 1
             if state["frame_count_for_process"] >= cfg.FRAME_PROCESS_INTERVAL:
                 state["frame_count_for_process"] = 0
                 if frame is not None and frame.size > 0:
-                    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Menggunakan frame yang sudah di-flip untuk deteksi MP (agar landmark sinkron dengan avatar)
+                    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) 
                     image_rgb.flags.writeable = False
                     try:
                         results = holistic.process(image_rgb)
@@ -242,18 +270,100 @@ def main():
                     results = state.get("last_mediapipe_results", None)
             else:
                 results = state.get("last_mediapipe_results", None)
+            
             if results is None:
                 state["user_is_idle"] = False
+            
+            # ... (Visual lip sync debug tidak berubah) ...
+            visual_mouth_state, current_mouth_ratio = calculate_visual_lip_sync(results)
 
-            # --- PANGGIL LOGIKA LAIN DARI vtuber_core ---
+            if state["frame_counter"] % 5 == 0: 
+                if results and results.face_landmarks:
+                    print(f"📊 [FRAME {state['frame_counter']:04d}] RASIO MULUT: {current_mouth_ratio:.4f} | STATE: {visual_mouth_state} | FACE: ✅ DETECTED")
+                else:
+                    print(f"⚠️  [FRAME {state['frame_counter']:04d}] FACE: ❌ NOT DETECTED - Pastikan wajah Anda terlihat kamera!")
+            
+            is_talking = False
+            if cfg.LIP_SYNC_MODE == "VISUAL":
+                state["target_mouth_state"] = visual_mouth_state
+                is_talking = (visual_mouth_state != "closed")
+            elif cfg.LIP_SYNC_MODE == "AUDIO":
+                is_talking = is_talking_audio
+            elif cfg.LIP_SYNC_MODE == "HYBRID":
+                state["target_mouth_state"] = visual_mouth_state 
+                is_talking = (visual_mouth_state != "closed")
+            
+            # ... (Logika tawa visual tidak berubah) ...
+            is_visual_laugh_detected = False
+            if state["laugh_cooldown_counter"] > 0:
+                state["laugh_cooldown_counter"] -= 1
+            
+# ============================================================
+# LOGIKA BARU: SUSTAIN LAUGH (TAHAN KETAWA & SHAKING)
+# ============================================================
+            
+            # 1. Cek apakah mulut terbuka lebar (di atas threshold)
+            if current_mouth_ratio > cfg.LAUGH_MOUTH_OPENNESS_THRESHOLD:
+                # Naikkan counter durasi
+                state["visual_laugh_duration_counter"] += 1
+                
+                # Jika sudah melewati batas minimum durasi (misal 2 frame)
+                if state["visual_laugh_duration_counter"] > cfg.LAUGH_DURATION_MIN_FRAMES:
+                    is_visual_laugh_detected = True
+                    
+                    # KUNCI RAHASIA: Jangan reset ke 0!
+                    # Kita kunci counter di angka yang aman agar status ketawa AKTIF TERUS
+                    state["visual_laugh_duration_counter"] = cfg.LAUGH_DURATION_MIN_FRAMES + 5
+                    
+                    # Matikan cooldown paksa agar shaking tidak berhenti
+                    state["laugh_cooldown_counter"] = 0 
+            else:
+                # 2. Jika mulut sudah menutup (kurang dari threshold)
+                # BARU kita reset counter ke 0.
+                # Ini artinya kamu sudah berhenti ketawa.
+                state["visual_laugh_duration_counter"] = 0
+                is_visual_laugh_detected = False
+            
+            # ============================================================
+
+            audio_laugh_score = 1.0 if is_audio_laugh_detected else 0.0
+            visual_laugh_score = 1.0 if is_visual_laugh_detected else 0.0
+            
+            combined_laugh_score = (audio_laugh_score * cfg.LAUGH_AUDIO_WEIGHT) + \
+                                   (visual_laugh_score * cfg.LAUGH_VISUAL_WEIGHT)
+            
+            is_laugh_detected = (combined_laugh_score >= cfg.LAUGH_COMBINED_THRESHOLD)
+
+            # ============================================
+            # BLOK INI DIUBAH/DITAMBAH (Logika Gestur)
+            # ============================================
             is_blinking, force_blink = determine_blink_state(state, results, get_aspect_ratio)
             detect_gestures(state, results)
-            update_idle_state(state)
-
+            
+            # --- Deteksi Arah Wajah ---
+            face_look_gesture = detect_face_direction(results)
+            state["face_direction_gesture"] = face_look_gesture or "NORMAL"
+            
+            # Panggil SATU FUNGSI IDLE TERPADU
+            update_unified_idle_state(state)
+            
+            # --- Atur Stable Gesture Akhir ---
+            current_gesture_from_buffer = state["stable_gesture"]
+            
+            if current_gesture_from_buffer != "NORMAL":
+                pass 
+            elif is_laugh_detected:
+                state["stable_gesture"] = "LAUGH"
+            elif face_look_gesture:
+                state["stable_gesture"] = face_look_gesture 
+            else:
+                state["stable_gesture"] = "NORMAL" 
+                
             if is_laugh_detected:
                 state["stable_gesture"] = "LAUGH"
+            # ============================================
                 
-            # --- UPDATE EFFECT STATE ---
+            # ... (Effect state management tidak berubah) ...
             current_gesture = state["stable_gesture"]
             last_gesture = state["last_gesture_for_effect"]
             
@@ -276,22 +386,21 @@ def main():
                 if not state["effect_laugh_active"]:
                     state["effect_laugh_active"] = True
                     if cap_effect_laugh: cap_effect_laugh.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    print("[DEBUG] LAUGH effect RE-activated from audio!")
 
-            # --- PANGGIL FUNGSI LOGIKA AKHIR DARI vtuber_core ---
+            # ... (Select assets tidak berubah, sudah didesain untuk ini) ...
             current_head_img, current_body_img = select_assets(state, assets, is_blinking, force_blink, is_talking, is_laugh_detected)
             if current_head_img is None or current_body_img is None:
                 print("FATAL: Asset selection failed.")
                 break
 
+            # ... (Calculate positions tidak berubah) ...
             pos_x_head, pos_y_head, pos_x_body, pos_y_body, pos_x_hair, pos_y_hair = calculate_positions(
                 state, results, frame_w, frame_h, current_head_img, current_body_img, assets.get("hair_back")
             )
 
-            # --- PANGGIL FUNGSI GAMBAR DARI renderer ---
+            # ... (Render tidak berubah) ...
             final_output = draw_background(state, frame_w, frame_h, cap_bg, assets.get("bg_virtual_img"))
             
-            # --- APPLY VIDEO EFFECTS (dari utils) ---
             if state["effect_excited_active"] and cap_effect_excited and cap_effect_excited.isOpened():
                 ret_fx, frame_fx = cap_effect_excited.read()
                 if ret_fx and frame_fx is not None:
@@ -313,11 +422,16 @@ def main():
                 else:
                     state["effect_thumbsup_active"] = False
             
-            # --- PANGGIL FUNGSI GAMBAR AKHIR DARI renderer ---
             final_output = draw_avatar_and_ui(final_output, state, assets, current_head_img, current_body_img,
                                               pos_x_head, pos_y_head, pos_x_body, pos_y_body,
                                               pos_x_hair, pos_y_hair)
             
+            # ============================================
+            # BLOK VISUALISASI MEDIAPIPE DIHAPUS/DIABAIKAN
+            # cv2.imshow('MediaPipe Detection Output', raw_detection_frame) 
+            # ============================================
+            
+            # ... (Show frame dan cleanup tidak berubah) ...
             try:
                 cv2.imshow(cfg.WINDOW_NAME, final_output)
             except Exception as e:
